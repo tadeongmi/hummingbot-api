@@ -581,11 +581,71 @@ async def _hyperliquid_perpetual(connector, symbol_map: Mapping[str, str]) -> Di
     return tickers
 
 
+def _derive_ticker_extract(row):
+    """Price out of a Derive ``public/get_ticker`` result (all numbers arrive as strings)."""
+    return (
+        row.get("instrument_name"),
+        _mid(row.get("best_bid_price"), row.get("best_ask_price"), row.get("mark_price")),
+        None,  # get_ticker carries no 24h volume; guessing one from open_interest would lie
+        None,
+    )
+
+
+def _derive_family(connector_name: str):
+    """Build the ticker adapter for a Derive connector (``derive`` spot, ``derive_perpetual``).
+
+    Derive has no bulk all-tickers endpoint, and the connector's own
+    ``get_all_pairs_prices()`` wraps each result as ``{"symbol": {"instrument_name": ...,
+    "best_bid": ..., "best_ask": ...}}`` — the symbol field is a dict and the prices are
+    nested inside it, so the generic extractor's flat key search finds no price, drops all
+    rows before symbol mapping, and the fetch fails with the misleading
+    "none of N ticker rows matched the symbol map ... payload symbols=[]".
+
+    This adapter fans out ``public/get_ticker`` over the symbol map's raw symbols (they are
+    exactly Derive instrument names), guarded per instrument so one failed request cannot
+    abort the rest. The request goes through the connector's ``_api_post`` so throttling and
+    base-URL handling are reused; the path is taken from the connector's own constants so a
+    Derive URL change shows up in exactly one place.
+    """
+
+    async def adapter(connector, symbol_map: Mapping[str, str]) -> Dict[str, Ticker]:
+        if connector_name == "derive_perpetual":
+            from hummingbot.connector.derivative.derive_perpetual import (
+                derive_perpetual_constants as derive_constants,
+            )
+        else:
+            from hummingbot.connector.exchange.derive import derive_constants
+
+        async def one(instrument: str) -> Optional[Dict[str, Any]]:
+            try:
+                payload = await connector._api_post(
+                    path_url=derive_constants.TICKER_PRICE_CHANGE_PATH_URL,
+                    data={"instrument_name": instrument},
+                )
+                result = payload.get("result") if isinstance(payload, dict) else None
+                return result if isinstance(result, dict) else None
+            except Exception as e:  # noqa: BLE001 - one instrument must not kill the batch
+                logger.debug(f"[{connector_name}] ticker fetch failed for {instrument}: {e}")
+                return None
+
+        results = await asyncio.gather(*(one(symbol) for symbol in symbol_map))
+        rows = [r for r in results if r]
+        if not rows:
+            raise TickerFetchError(
+                f"'{connector_name}': all {len(symbol_map)} per-instrument ticker requests failed"
+            )
+        return _normalize(symbol_map, rows, _derive_ticker_extract, connector_name)
+
+    return adapter
+
+
 TICKER_ADAPTERS: Dict[
     str, Callable[[Any, Mapping[str, str]], Awaitable[Dict[str, Ticker]]]
 ] = {
     "hyperliquid": _hyperliquid,
     "hyperliquid_perpetual": _hyperliquid_perpetual,
+    "derive": _derive_family("derive"),
+    "derive_perpetual": _derive_family("derive_perpetual"),
 }
 
 

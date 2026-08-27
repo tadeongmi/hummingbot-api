@@ -40,6 +40,32 @@ def validate_safe_name(name: str, label: str = "name") -> str:
     return name
 
 
+def coerce_price(value: Any) -> Optional[Decimal]:
+    """
+    Parse a price-like value from a connector or the ticker pool into a positive Decimal.
+
+    Connectors do not honor their own type hints here: derive_perpetual's
+    ``_get_last_traded_price`` is declared ``-> float`` but returns the exchange's raw JSON
+    string (Derive serializes every number as a string). A raw string reaching a
+    ``price > 0`` comparison raises ``TypeError: '>' not supported between instances of
+    'str' and 'int'``, and because the per-account update wraps the whole token loop, one
+    unpriceable asset used to discard every balance in the account — including the ones
+    that priced fine.
+
+    Returns the value as a Decimal when it parses to a finite number > 0, otherwise None
+    (never raises).
+    """
+    if value is None:
+        return None
+    try:
+        price = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if not price.is_finite() or price <= 0:
+        return None
+    return price
+
+
 class AccountsService:
     """
     This class is responsible for managing all the accounts that are connected to the trading system. It is responsible
@@ -516,8 +542,10 @@ class AccountsService:
                 # mismatches on exchanges that don't list the global quote (e.g. hyperliquid
                 # quotes in USDC/USD, not USDT).
                 base, quote = self._market_components(token, connector_name)
-                rate = self._market_data_service.get_rate_for_connector(connector_name, base, quote)
-                if rate and rate > 0:
+                rate = coerce_price(
+                    self._market_data_service.get_rate_for_connector(connector_name, base, quote)
+                )
+                if rate is not None:
                     price = rate
                 else:
                     # Queue for fallback batch fetch from exchange
@@ -565,10 +593,15 @@ class AccountsService:
             if isinstance(result, Exception):
                 logger.warning(f"Failed to get price for a pair: {result}")
                 continue
-            pair, price = result
-            if price and price > 0:
+            pair, raw_price = result
+            # This is where the historical crash lived: derive_perpetual returns the price
+            # as a string, and a bare ``price > 0`` on it raised out of the whole account
+            # update. Coerce first; an unparseable price falls through to the cached
+            # fallback exactly like a missing one.
+            price = coerce_price(raw_price)
+            if price is not None:
                 self._last_known_prices[pair] = price
-            last_traded[pair] = price
+                last_traded[pair] = price
 
         # Fill in fallbacks for any pairs that failed
         missing_pairs = [pair for pair in trading_pairs if pair not in last_traded]
